@@ -9,8 +9,18 @@
   "homepage": "https://github.com/Sarti2004/PianoFolder",
   "repository": "https://github.com/Sarti2004/PianoFolder",
   "entrypoints": {
-    "win-x64": { "executable": "runtimes/win-x64/Sarti2004.PianoFolder.exe" },
-    "osx-arm64": { "executable": "runtimes/osx-arm64/Sarti2004.PianoFolder" }
+    "win-x64": {
+      "executable": "runtimes/win-x64/MacroDeck.PluginTemplate.dll",
+      "runtime": { "kind": "FrameworkDependent", "dotnetVersion": "10.0" }
+    },
+    "osx-arm64": {
+      "executable": "runtimes/osx-arm64/MacroDeck.PluginTemplate.dll",
+      "runtime": { "kind": "FrameworkDependent", "dotnetVersion": "10.0" }
+    },
+    "linux-x64": {
+      "executable": "runtimes/linux-x64/MacroDeck.PluginTemplate.dll",
+      "runtime": { "kind": "FrameworkDependent", "dotnetVersion": "10.0" }
+    }
   },
   "publisher": {
     "name": "Example Publisher"
