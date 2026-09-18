@@ -1,0 +1,960 @@
+# The Macro Deck plugin publishing workflow.
+#
+# It is a *reusable* workflow rather than a composite action, and that distinction is the entire
+# security design. A composite action runs inside the caller's own job, so the OIDC token's
+# job_workflow_ref still names the creator's workflow and proves nothing about the build steps. A
+# reusable workflow invoked with `uses:` sets job_workflow_ref to this file, while `repository` and
+# `sha` still name the creator's repository and commit - which is exactly the pair the Platform
+# needs. The Platform's TrustedBuild:ApprovedJobWorkflowRefs allowlist names this file, at a `v*` tag,
+# and this file only.
+#
+# Setting up the CLI and building are the composite actions under actions/ in this repository, which
+# are useful on their own for builds that are not published. They are referenced by repository and
+# major tag, never by a local path: `./` would resolve against the caller's checkout, handing the
+# build steps to the very repository whose build this workflow is meant to vouch for. The upload
+# stays in this file: it is only ever accepted from here, so it has no use as an action.
+#
+# The upload credential never shares a job with the creator's code. Any step of a job holding
+# `id-token: write` can mint the OIDC token itself - build scripts, MSBuild targets and tests included -
+# and a token minted there carries this file's job_workflow_ref like one minted by the upload step. So
+# the work is split into separate jobs:
+#
+#   plan       reads the manifest's entrypoints and decides which runtime identifiers are built, on
+#              which runners, and on which runners the stub host runs. Checks the repository out but runs
+#              none of its code; holds `contents: read`.
+#   build      builds the package, runs the repository's tests and lists the dependencies. Runs the
+#              creator's code, holds `contents: read` and nothing else. With build-per-platform it is
+#              a matrix of one job per runtime identifier, each building only its own with
+#              `macrodeck-plugin build --rid`; the tests and the dependency list run once, on the
+#              first of them.
+#   package    only with build-per-platform: combines those single-platform packages into the one
+#              multi-platform package with `macrodeck-plugin merge`. Checks nothing out, runs none of
+#              the creator's code and holds no permission.
+#   stub-host  runs the conformance suite against the built package on a disposable stub host, as a
+#              matrix of one job per platform the manifest declares, each on a runner of that platform,
+#              and hands the JSON reports to the upload. Runs the plugin, holds no permission.
+#   upload     packs build-metadata.json, the dependency list and the conformance reports, one per
+#              platform, if there are any, and uploads to the Platform. Holds `id-token: write` only, checks nothing out and
+#              executes nothing from the repository.
+#
+# The package moves between the jobs as a workflow artifact. Its SHA-256 is recorded right after the
+# build, checked again before the build job hands it over (so the tests cannot have swapped it), and
+# checked by each job that receives it - including `package`, which checks every platform package it
+# merges and records the digest of the merged one. A release is started from the uploaded build in the
+# Creator Portal.
+
+name: Publish a Macro Deck plugin
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: >-
+          The version this build declares; one leading `v` is dropped, so a tag name can be passed
+          as-is. It is written into the plugin's manifest.json and set as the assembly version, so
+          the version in the repository does not matter. A release started from the build in the
+          Creator Portal takes this number.
+        required: true
+        type: string
+      build:
+        description: >-
+          The build identifier, 1-64 letters, digits, `.`, `-`, `_` or `+`. Defaults to the run
+          number.
+        required: false
+        type: string
+        default: ''
+      source:
+        description: The plugin project directory, holding manifest.json and macrodeck-build.json.
+        required: true
+        type: string
+      build-per-platform:
+        description: >-
+          Build each runtime identifier the manifest declares on a runner of its own platform and
+          merge the results into one package with `macrodeck-plugin merge`. Needed when a target only
+          builds natively - a net10.0-windows target, or a native library compiled per platform. Off
+          by default, because one Linux runner cross-builds every platform a plain .NET plugin
+          declares, in one job and one restore.
+        required: false
+        type: boolean
+        default: false
+      runners:
+        description: >-
+          A JSON object naming the runner that builds a runtime identifier, merged over the defaults
+          (linux-x64 ubuntu-latest, win-x64 windows-latest, osx-arm64 macos-latest, linux-arm64
+          ubuntu-24.04-arm, win-arm64 windows-11-arm, osx-x64 macos-15-intel). Use it for a self-hosted
+          runner or a pinned image, for example {"osx-arm64": "macos-15"}. Read with
+          build-per-platform, and for the stub host runners.
+        required: false
+        type: string
+        default: '{}'
+      changelog:
+        required: false
+        type: string
+        default: ''
+      run-tests:
+        description: >-
+          Run the repository's tests with `dotnet test` after the build. Without test-path the
+          repository's only solution (*.sln or *.slnx at its root) is tested; with none, or several,
+          the step is skipped with a warning.
+        required: false
+        type: boolean
+        default: true
+      test-path:
+        description: The solution, project or directory `dotnet test` runs, relative to the repository root.
+        required: false
+        type: string
+        default: ''
+      run-stub-host:
+        description: >-
+          Run the plugin conformance suite (`macrodeck-plugin test`) against the built package on a
+          disposable stub host. A required check that fails stops the release; otherwise the report is
+          uploaded with the build as conformance.json and shown to the moderator reviewing it. Without
+          it the review warns that the plugin was never run on a stub host.
+        required: false
+        type: boolean
+        default: true
+      cli-version:
+        description: The MacroDeck.Plugin.Cli version to build with. Defaults to the newest prerelease.
+        required: false
+        type: string
+        default: ''
+      upload-artifact:
+        description: Also keep the built .macroDeckPlugin as a workflow artifact of the run.
+        required: false
+        type: boolean
+        default: false
+      artifact-name:
+        description: The workflow artifact's name. Defaults to the package file name.
+        required: false
+        type: string
+        default: ''
+      artifact-retention-days:
+        description: Days to keep the workflow artifact, 1-90. 0 uses the repository's default.
+        required: false
+        type: number
+        default: 0
+      platform-url:
+        required: false
+        type: string
+        default: https://api.macro-deck.app
+      audience:
+        description: >-
+          The audience the Platform expects in the OIDC token. Changing it means the Platform will
+          refuse the upload, which is the point: a token minted for somebody else is not a token
+          for us.
+        required: false
+        type: string
+        default: https://api.macro-deck.app
+
+jobs:
+  # Only the manifest decides what is built: the runtime identifiers it declares entrypoints for. This
+  # job reads them and nothing else - it never runs a build script - so the matrix below, and the stub
+  # host's runners, are settled before any of the repository's code has run.
+  plan:
+    name: Plan the build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      stub-host-matrix: ${{ steps.plan.outputs.stub-host-matrix }}
+      handoff-prefix: ${{ steps.plan.outputs.handoff-prefix }}
+    steps:
+      - name: Check out the reviewed commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Decide what is built where
+        id: plan
+        env:
+          SOURCE: ${{ inputs.source }}
+          VERSION: ${{ inputs.version }}
+          BUILD_PER_PLATFORM: ${{ inputs.build-per-platform }}
+          RUNNERS: ${{ inputs.runners }}
+        run: |
+          set -euo pipefail
+          manifest="${SOURCE%/}/manifest.json"
+          if [ ! -f "${manifest}" ]; then
+            echo "::error::${manifest} does not exist. Does source point at the plugin project directory?"
+            exit 1
+          fi
+          declared="$(jq -r '.entrypoints // {} | keys[]' "${manifest}")"
+          if [ -z "${declared}" ]; then
+            echo "::error::${manifest} declares no entrypoints, so there is nothing to build."
+            exit 1
+          fi
+
+          # The hosted runner each platform is built and run on. The runners input overrides an entry
+          # and adds one for a runtime identifier not listed here.
+          overrides="${RUNNERS:-}"
+          [ -n "${overrides}" ] || overrides='{}'
+          if ! jq -e 'type == "object"' <<< "${overrides}" > /dev/null 2>&1; then
+            echo "::error::runners is not a JSON object."
+            exit 1
+          fi
+          runners="$(jq -c --argjson overrides "${overrides}" '. + $overrides' <<< '{
+            "linux-x64": "ubuntu-latest",
+            "win-x64": "windows-latest",
+            "osx-arm64": "macos-latest",
+            "linux-arm64": "ubuntu-24.04-arm",
+            "win-arm64": "windows-11-arm",
+            "osx-x64": "macos-15-intel"
+          }')"
+
+          # Declared platforms, Linux first: the first of them runs the tests and the dependency
+          # listing, which are cheapest and best supported there. A
+          # platform the defaults do not know keeps its declared order, after the ones they do.
+          ordered=""
+          for rid in linux-x64 win-x64 osx-arm64 linux-arm64 win-arm64 osx-x64; do
+            printf '%s\n' "${declared}" | grep -qx "${rid}" && ordered="${ordered}${rid}"$'\n'
+          done
+          while read -r rid; do
+            [ -n "${rid}" ] || continue
+            printf '%s\n' "${ordered}" | grep -qx "${rid}" || ordered="${ordered}${rid}"$'\n'
+          done <<< "${declared}"
+
+          if [ "${BUILD_PER_PLATFORM}" = "true" ]; then
+            include='[]'
+            first=true
+            while read -r rid; do
+              [ -n "${rid}" ] || continue
+              os="$(jq -r --arg rid "${rid}" '.[$rid] // empty' <<< "${runners}")"
+              if [ -z "${os}" ]; then
+                echo "::error::No runner is known for ${rid}. Name one in the runners input, for example {\"${rid}\": \"my-runner\"}."
+                exit 1
+              fi
+              include="$(jq -c --arg rid "${rid}" --arg os "${os}" --argjson first "${first}" \
+                '. + [{rid: $rid, os: $os, primary: $first}]' <<< "${include}")"
+              first=false
+            done <<< "${ordered}"
+            echo "Building $(jq -r '[.[] | "\(.rid) on \(.os)"] | join(", ")' <<< "${include}"), then merging them."
+          else
+            # One job builds every declared platform, and `build` without --rid packs them into the one
+            # package - so there is nothing to merge.
+            include='[{"rid": "", "os": "ubuntu-latest", "primary": true}]'
+            echo "Building $(printf '%s' "${ordered}" | paste -sd ' ' -) on ubuntu-latest."
+          fi
+          # Not --argjson include: `include` is a jq keyword, and a variable cannot be named after one.
+          jq -c -n --argjson entries "${include}" '{"include": $entries}' \
+            | sed 's/^/matrix=/' >> "${GITHUB_OUTPUT}"
+
+          # The stub host runs the package's entrypoint for the runner's own platform, so every
+          # declared platform is run on a runner of its own: a Windows entrypoint on Windows, a macOS
+          # one on macOS, a Linux one on Linux. A platform no runner is known for is not run. A matrix
+          # cannot be empty, so a plugin declaring no runnable platform gets one entry without a
+          # runtime identifier, which only warns.
+          stub_hosts='[]'
+          while read -r rid; do
+            [ -n "${rid}" ] || continue
+            os="$(jq -r --arg rid "${rid}" '.[$rid] // empty' <<< "${runners}")"
+            if [ -z "${os}" ]; then
+              echo "::warning::No runner is known for ${rid}, so its entrypoint is not run on a stub host. Name one in the runners input to run it."
+              continue
+            fi
+            stub_hosts="$(jq -c --arg rid "${rid}" --arg os "${os}" '. + [{rid: $rid, os: $os}]' <<< "${stub_hosts}")"
+          done <<< "${ordered}"
+          if [ "$(jq 'length' <<< "${stub_hosts}")" -gt 0 ]; then
+            echo "The stub host runs $(jq -r '[.[] | "\(.rid) on \(.os)"] | join(", ")' <<< "${stub_hosts}")."
+          else
+            stub_hosts='[{"rid": "", "os": "ubuntu-latest"}]'
+          fi
+          jq -c -n --argjson entries "${stub_hosts}" '{"include": $entries}' \
+            | sed 's/^/stub-host-matrix=/' >> "${GITHUB_OUTPUT}"
+
+          # Names the run's handoff artifacts. Unique per call, so a caller publishing several plugins
+          # in one run gets its own set for each.
+          key="$(printf '%s\n%s' "${SOURCE}" "${VERSION}" | sha256sum | cut -c1-16)"
+          echo "handoff-prefix=macro-deck-publish-${GITHUB_RUN_ATTEMPT}-${key}" >> "${GITHUB_OUTPUT}"
+
+      # Before the matrix, not after it: a CLI that cannot merge would only be found once every
+      # platform had been built.
+      - name: Set up the Macro Deck plugin CLI
+        if: ${{ inputs.build-per-platform }}
+        uses: Macro-Deck-App/GitHub-Actions/actions/setup-plugin-cli@v1
+        with:
+          cli-version: ${{ inputs.cli-version }}
+
+      - name: Check that the CLI can merge
+        if: ${{ inputs.build-per-platform }}
+        run: |
+          set -euo pipefail
+          # `merge --help` is no test: an unknown command falls back to the root help and exits 0.
+          if ! macrodeck-plugin --help | grep -qE '^[[:space:]]+merge[[:space:]]'; then
+            echo "::error::macrodeck-plugin $(macrodeck-plugin --version) has no merge command, so a per-platform build cannot be packaged. Set cli-version to 3.0.0-beta.11 or newer."
+            exit 1
+          fi
+
+  build:
+    name: Build and test${{ inputs.build-per-platform && format(' {0}', matrix.rid) || '' }}
+    needs: plan
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing should still show whether the others build.
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        # The steps below are written for bash, which a Windows runner does not default to.
+        shell: bash
+    # Read by the jobs after this one only when the matrix has a single job, which is every build that
+    # is not per-platform. A per-platform build takes them from `package` instead: a matrix job's
+    # outputs are whichever job finished last.
+    outputs:
+      handoff: ${{ steps.handoff.outputs.name }}
+      package-file-name: ${{ steps.build.outputs.package-file-name }}
+      sha256: ${{ steps.digest.outputs.sha256 }}
+    steps:
+      # Pinned to the commit the workflow was called for rather than to a moving ref. The token
+      # attests to github.sha, so building anything else would make the attestation a false
+      # statement about the bytes.
+      - name: Check out the reviewed commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up the Macro Deck plugin CLI
+        uses: Macro-Deck-App/GitHub-Actions/actions/setup-plugin-cli@v1
+        with:
+          cli-version: ${{ inputs.cli-version }}
+
+      - name: Build and pack
+        id: build
+        uses: Macro-Deck-App/GitHub-Actions/actions/build-plugin@v1
+        with:
+          source: ${{ inputs.source }}
+          version: ${{ inputs.version }}
+          rid: ${{ matrix.rid }}
+
+      - name: Record the package digest
+        id: digest
+        env:
+          PACKAGE_PATH: ${{ steps.build.outputs.package-path }}
+        run: |
+          set -euo pipefail
+          # macOS has shasum where Linux and Git for Windows have sha256sum. Always hash stdin: given a
+          # path with a backslash, as every path on Windows has, sha256sum prefixes its line with `\`.
+          if command -v sha256sum > /dev/null; then
+            sha256="$(sha256sum < "${PACKAGE_PATH}" | cut -d' ' -f1)"
+          else
+            sha256="$(shasum -a 256 < "${PACKAGE_PATH}" | cut -d' ' -f1)"
+          fi
+          echo "sha256=${sha256}" >> "${GITHUB_OUTPUT}"
+          echo "Built $(basename "${PACKAGE_PATH}") (SHA-256 ${sha256})."
+
+      # Before the tests, so the package is kept even when they fail. A per-platform build keeps the
+      # merged package instead, from `package`: one artifact, covering every platform, as a build that
+      # was not split would have produced.
+      - name: Keep the package as a workflow artifact
+        if: ${{ inputs.upload-artifact && !inputs.build-per-platform }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.artifact-name || steps.build.outputs.package-file-name }}
+          path: ${{ steps.build.outputs.package-path }}
+          retention-days: ${{ inputs.artifact-retention-days }}
+          if-no-files-found: error
+
+      # On the first platform only. The tests cover the repository, not the runner, and running them
+      # once is what a build that was not split does.
+      - name: Run the tests
+        if: ${{ inputs.run-tests && matrix.primary }}
+        env:
+          TEST_PATH: ${{ inputs.test-path }}
+        run: |
+          set -euo pipefail
+          target="${TEST_PATH}"
+          if [ -z "${target}" ]; then
+            shopt -s nullglob
+            solutions=(*.sln *.slnx)
+            shopt -u nullglob
+            if [ "${#solutions[@]}" -ne 1 ]; then
+              echo "::warning::No tests were run: found ${#solutions[@]} solutions at the repository root. Set test-path, or run-tests: false."
+              exit 0
+            fi
+            target="${solutions[0]}"
+          fi
+          echo "Testing ${target}."
+          dotnet test "${target}" -c Release
+
+      # Required. The NuGet packages the build restored, for the Platform's dependency policy (minimum
+      # Macro Deck SDK version, blocked packages), the moderator and the security scan: each package
+      # with its resolved version, whether the project references it directly, the feed it came from
+      # and any known vulnerability. The Platform refuses an upload without it, so any problem here
+      # fails the release. The schema is in the README; this step keeps within the Platform's limits
+      # (1 MiB, 5,000 packages) and fails rather than send a file the Platform would refuse.
+      - name: List the dependencies
+        if: ${{ matrix.primary }}
+        env:
+          SOURCE: ${{ inputs.source }}
+        run: |
+          set -uo pipefail
+          work="${RUNNER_TEMP}/dependencies"
+          rm -rf "${work}"
+          mkdir -p "${work}" "${RUNNER_TEMP}/upload"
+          rm -f "${RUNNER_TEMP}/upload/dependencies.json"
+          fail() {
+            echo "::error title=No dependency list::The dependencies could not be listed, and the Platform refuses a build without them: $1"
+            exit 1
+          }
+
+          # The project macrodeck-build.json publishes, or else the only project file beside it.
+          project=""
+          if [ -f "${SOURCE}/macrodeck-build.json" ]; then
+            project="$(jq -r '[.targets[]? | select(.executable == "dotnet") | .arguments[]?
+              | strings | select(test("\\.(cs|fs|vb)proj$"))] | first // empty' \
+              "${SOURCE}/macrodeck-build.json" 2>/dev/null)" || project=""
+          fi
+          if [ -z "${project}" ]; then
+            shopt -s nullglob
+            candidates=("${SOURCE}"/*.csproj "${SOURCE}"/*.fsproj "${SOURCE}"/*.vbproj)
+            shopt -u nullglob
+            [ "${#candidates[@]}" -eq 1 ] || fail "no single project file was found in ${SOURCE}."
+            project="$(basename "${candidates[0]}")"
+          fi
+          case "${project}" in
+            /*) project_path="${project}" ;;
+            *) project_path="${SOURCE}/${project}" ;;
+          esac
+          [ -f "${project_path}" ] || fail "${project_path} does not exist."
+
+          assets="$(dotnet msbuild "${project_path}" -getProperty:ProjectAssetsFile 2>/dev/null | tail -n 1)" || assets=""
+          if [ -z "${assets}" ] || [ ! -f "${assets}" ]; then
+            dotnet restore "${project_path}" > "${work}/restore.log" 2>&1 || fail "the project could not be restored."
+            assets="$(dirname "${project_path}")/obj/project.assets.json"
+          fi
+          [ -f "${assets}" ] || fail "the project's assets file was not found."
+
+          dotnet list "${project_path}" package --include-transitive --format json \
+            > "${work}/packages.json" 2> "${work}/packages.log" \
+            || fail "dotnet list package failed."
+
+          # Needs the feeds' vulnerability data (nuget.org's). If it cannot be reached, only this part
+          # is lost, and the list says it was not checked.
+          checked=true
+          if ! dotnet list "${project_path}" package --vulnerable --include-transitive --format json \
+            > "${work}/vulnerable.json" 2> "${work}/vulnerable.log" \
+            || ! jq -e '.version == 1' "${work}/vulnerable.json" > /dev/null 2>&1; then
+            echo "::warning::Known vulnerabilities could not be checked; the dependency list says so."
+            checked=false
+            echo '{}' > "${work}/vulnerable.json"
+          fi
+
+          # Which feed each package came from, from the .nupkg.metadata NuGet writes beside it in the
+          # packages folder. The first folder holding a package wins; one without metadata has no source.
+          jq -r '(.packageFolders // {} | keys[]) as $folder | .libraries // {} | to_entries[]
+            | select(.value.type == "package")
+            | [(.key | ascii_downcase), "\($folder | rtrimstr("/"))/\(.value.path)/.nupkg.metadata"] | @tsv' \
+            "${assets}" > "${work}/libraries.tsv" || fail "the assets file could not be read."
+          while IFS=$'\t' read -r key metadata; do
+            [ -f "${metadata}" ] || continue
+            feed="$(jq -r '.source // empty' "${metadata}" 2>/dev/null)" || continue
+            [ -n "${feed}" ] && printf '%s\t%s\n' "${key}" "${feed}"
+          done < "${work}/libraries.tsv" > "${work}/resolved.tsv"
+          jq -Rn '[inputs | split("\t") | {key: .[0], value: .[1]}] | reverse | from_entries' \
+            "${work}/resolved.tsv" > "${work}/resolved.json" || fail "the package feeds could not be read."
+
+          jq -n \
+            --slurpfile packages "${work}/packages.json" \
+            --slurpfile vulnerable "${work}/vulnerable.json" \
+            --slurpfile assets "${assets}" \
+            --slurpfile resolved "${work}/resolved.json" \
+            --argjson checked "${checked}" \
+            --arg workspace "${GITHUB_WORKSPACE%/}" \
+            --arg sdk "$(dotnet --version)" \
+            '
+            # A feed inside the checkout is written relative to it (./local-feed), so the Platform can
+            # tell a committed feed from one on the runner. Credentials and query strings are dropped.
+            def feed:
+              sub("/+$"; "")
+              | if $workspace != "" and startswith($workspace + "/") then "./" + ltrimstr($workspace + "/")
+                elif test("^https?://"; "i") then sub("^(?<scheme>[A-Za-z]+://)[^/@]*@"; "\(.scheme)") | sub("[?#].*$"; "")
+                else . end;
+            ($vulnerable[0].projects[0].frameworks // [] | map(.framework as $framework
+              | ((.topLevelPackages // []) + (.transitivePackages // []))[]
+              | {key: "\($framework)|\(.id | ascii_downcase)",
+                 value: [.vulnerabilities[]? | {severity, advisoryUrl: .advisoryurl}]})
+              | from_entries) as $advisories
+            | {
+                schemaVersion: 1,
+                generatedBy: "Macro-Deck-App/GitHub-Actions publish-plugin.yml",
+                sdkVersion: $sdk,
+                vulnerabilitiesChecked: $checked,
+                sources: [$assets[0].project.restore.sources // {} | keys[] | feed] | unique,
+                frameworks: [$packages[0].projects[0].frameworks[]? | .framework as $framework | {
+                  framework: $framework,
+                  packages: [
+                    ((.topLevelPackages // [])[] | . + {direct: true}),
+                    ((.transitivePackages // [])[] | . + {direct: false})
+                    | select(.resolvedVersion != null)
+                    | {id, requestedVersion, resolvedVersion, direct,
+                       source: ($resolved[0]["\(.id | ascii_downcase)/\(.resolvedVersion | ascii_downcase)"]
+                         | if . == null then null else feed end),
+                       vulnerabilities: ($advisories["\($framework)|\(.id | ascii_downcase)"] // [])}
+                    | with_entries(select(.value != null))
+                  ]
+                }]
+              }
+            ' > "${work}/dependencies.json" || fail "the dependency list could not be assembled."
+
+          count="$(jq '[.frameworks[].packages | length] | add // 0' "${work}/dependencies.json")" \
+            || fail "the dependency list could not be read back."
+          size="$(wc -c < "${work}/dependencies.json" | tr -d ' ')"
+          [ "${count}" -le 5000 ] || fail "${count} packages is more than the 5,000 the Platform accepts."
+          [ "${size}" -le 1048576 ] || fail "the list is larger than the 1 MiB the Platform accepts."
+          mv "${work}/dependencies.json" "${RUNNER_TEMP}/upload/dependencies.json"
+          echo "Listed ${count} package references for $(jq -r '[.frameworks[].framework] | join(", ")' "${RUNNER_TEMP}/upload/dependencies.json")."
+
+      # The tests and the dependency listing ran the repository's code after the build. The package it
+      # hands over has to be the one the build produced.
+      - name: Hand the package over
+        id: handoff
+        env:
+          PACKAGE_PATH: ${{ steps.build.outputs.package-path }}
+          PACKAGE_FILE_NAME: ${{ steps.build.outputs.package-file-name }}
+          SHA256: ${{ steps.digest.outputs.sha256 }}
+          HANDOFF_PREFIX: ${{ needs.plan.outputs.handoff-prefix }}
+          RID: ${{ matrix.rid }}
+        run: |
+          set -euo pipefail
+          if command -v sha256sum > /dev/null; then
+            actual="$(sha256sum < "${PACKAGE_PATH}" | cut -d' ' -f1)"
+          else
+            actual="$(shasum -a 256 < "${PACKAGE_PATH}" | cut -d' ' -f1)"
+          fi
+          if [ "${actual}" != "${SHA256}" ]; then
+            echo "::error::The package changed after it was built: its SHA-256 is ${actual}, the build recorded ${SHA256}."
+            exit 1
+          fi
+          handoff="${RUNNER_TEMP}/handoff"
+          rm -rf "${handoff}"
+          mkdir -p "${handoff}"
+          cp "${PACKAGE_PATH}" "${handoff}/"
+          # Beside the package, because a matrix job's outputs do not survive as one value per job:
+          # `package` reads the digest from here to check what it merges.
+          printf '%s  %s\n' "${SHA256}" "${PACKAGE_FILE_NAME}" > "${handoff}/sha256.txt"
+          if [ -f "${RUNNER_TEMP}/upload/dependencies.json" ]; then
+            cp "${RUNNER_TEMP}/upload/dependencies.json" "${handoff}/"
+          fi
+          echo "name=${HANDOFF_PREFIX}-build-${RID:-all}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload the handoff
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.handoff.outputs.name }}
+          path: ${{ runner.temp }}/handoff
+          retention-days: 1
+          if-no-files-found: error
+
+  # Each matrix job built one platform; this is where they become the package that is published. The
+  # CLI's `merge` refuses anything that does not belong together - a different plugin or version, a
+  # manifest that differs beyond its entrypoints, a runtime identifier twice, a shared file with
+  # differing bytes - so the result is the package a build of the same commit on a machine that can
+  # build every platform would have produced.
+  package:
+    name: Merge the platform packages
+    needs: [plan, build]
+    if: ${{ inputs.build-per-platform }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      handoff: ${{ steps.handoff.outputs.name }}
+      package-file-name: ${{ steps.merge.outputs.package-file-name }}
+      sha256: ${{ steps.digest.outputs.sha256 }}
+    steps:
+      - name: Download the platform packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: ${{ needs.plan.outputs.handoff-prefix }}-build-*
+          path: ${{ runner.temp }}/platforms
+
+      - name: Check the package digests
+        env:
+          PLATFORMS: ${{ runner.temp }}/platforms
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          directories=("${PLATFORMS}"/*/)
+          if [ "${#directories[@]}" -eq 0 ]; then
+            echo "::error::No platform packages were handed over."
+            exit 1
+          fi
+          for directory in "${directories[@]}"; do
+            if [ ! -f "${directory}sha256.txt" ]; then
+              echo "::error::$(basename "${directory}") has no digest, so it cannot be the package its build produced."
+              exit 1
+            fi
+            (cd "${directory}" && sha256sum -c sha256.txt) || {
+              echo "::error::$(basename "${directory}") is not the package its build produced."
+              exit 1
+            }
+          done
+
+      - name: Set up the Macro Deck plugin CLI
+        uses: Macro-Deck-App/GitHub-Actions/actions/setup-plugin-cli@v1
+        with:
+          cli-version: ${{ inputs.cli-version }}
+
+      - name: Merge them into one package
+        id: merge
+        env:
+          PLATFORMS: ${{ runner.temp }}/platforms
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=("${PLATFORMS}"/*/*.macroDeckPlugin)
+          if [ "${#packages[@]}" -eq 0 ]; then
+            echo "::error::No .macroDeckPlugin was handed over."
+            exit 1
+          fi
+          output="${RUNNER_TEMP}/merged"
+          rm -rf "${output}"
+          mkdir -p "${output}"
+          macrodeck-plugin merge "${packages[@]}" --output "${output}"
+          merged=("${output}"/*.macroDeckPlugin)
+          if [ "${#merged[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one merged .macroDeckPlugin, found ${#merged[@]}."
+            exit 1
+          fi
+          package="$(realpath "${merged[0]}")"
+          echo "package-path=${package}" >> "${GITHUB_OUTPUT}"
+          echo "package-file-name=$(basename "${package}")" >> "${GITHUB_OUTPUT}"
+
+      - name: Record the package digest
+        id: digest
+        env:
+          PACKAGE_PATH: ${{ steps.merge.outputs.package-path }}
+        run: |
+          set -euo pipefail
+          sha256="$(sha256sum < "${PACKAGE_PATH}" | cut -d' ' -f1)"
+          echo "sha256=${sha256}" >> "${GITHUB_OUTPUT}"
+          echo "Merged $(basename "${PACKAGE_PATH}") (SHA-256 ${sha256})."
+
+      - name: Keep the package as a workflow artifact
+        if: ${{ inputs.upload-artifact }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.artifact-name || steps.merge.outputs.package-file-name }}
+          path: ${{ steps.merge.outputs.package-path }}
+          retention-days: ${{ inputs.artifact-retention-days }}
+          if-no-files-found: error
+
+      - name: Hand the package over
+        id: handoff
+        env:
+          PACKAGE_PATH: ${{ steps.merge.outputs.package-path }}
+          PLATFORMS: ${{ runner.temp }}/platforms
+          HANDOFF_PREFIX: ${{ needs.plan.outputs.handoff-prefix }}
+        run: |
+          set -euo pipefail
+          handoff="${RUNNER_TEMP}/handoff"
+          rm -rf "${handoff}"
+          mkdir -p "${handoff}"
+          cp "${PACKAGE_PATH}" "${handoff}/"
+          # One build listed the dependencies; the list is about the project, not a platform.
+          dependencies="$(find "${PLATFORMS}" -name dependencies.json -print -quit)"
+          if [ -z "${dependencies}" ]; then
+            echo "::error::No build handed over a dependency list, and the Platform refuses a build without one."
+            exit 1
+          fi
+          cp "${dependencies}" "${handoff}/dependencies.json"
+          echo "name=${HANDOFF_PREFIX}-package" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload the handoff
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.handoff.outputs.name }}
+          path: ${{ runner.temp }}/handoff
+          retention-days: 1
+          if-no-files-found: error
+
+  stub-host:
+    name: Run on a stub host${{ matrix.rid && format(' {0}', matrix.rid) || '' }}
+    needs: [plan, build, package]
+    # `package` is skipped unless the build was split per platform, and a skipped dependency skips this
+    # job unless the condition says otherwise.
+    if: ${{ !cancelled() && inputs.run-stub-host && needs.build.result == 'success' && (needs.package.result == 'success' || needs.package.result == 'skipped') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions: {}
+    strategy:
+      # Every platform reports, even when another one already failed.
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.stub-host-matrix) }}
+    # From `package` when the build was split per platform, from `build` when one job built everything.
+    env:
+      HANDOFF: ${{ needs.package.outputs.handoff || needs.build.outputs.handoff }}
+      PACKAGE_FILE_NAME: ${{ needs.package.outputs.package-file-name || needs.build.outputs.package-file-name }}
+      SHA256: ${{ needs.package.outputs.sha256 || needs.build.outputs.sha256 }}
+    steps:
+      - name: No runnable platform
+        if: ${{ matrix.rid == '' }}
+        shell: bash
+        run: |
+          echo "::warning::The manifest declares no platform a runner provides (linux-x64, win-x64, osx-arm64, linux-arm64, win-arm64, osx-x64), so the plugin was not run on a stub host."
+
+      - name: Download the package
+        if: ${{ matrix.rid != '' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.HANDOFF }}
+          path: ${{ runner.temp }}/handoff
+
+      - name: Check the package digest
+        if: ${{ matrix.rid != '' }}
+        shell: bash
+        env:
+          PACKAGE: ${{ runner.temp }}/handoff/${{ env.PACKAGE_FILE_NAME }}
+        run: |
+          set -euo pipefail
+          if command -v sha256sum > /dev/null; then
+            actual="$(sha256sum < "${PACKAGE}" | cut -d' ' -f1)"
+          else
+            actual="$(shasum -a 256 < "${PACKAGE}" | cut -d' ' -f1)"
+          fi
+          if [ "${actual}" != "${SHA256}" ]; then
+            echo "::error::$(basename "${PACKAGE}") is not the package the build produced: its SHA-256 is ${actual}, the build recorded ${SHA256}."
+            exit 1
+          fi
+
+      - name: Set up the Macro Deck plugin CLI
+        if: ${{ matrix.rid != '' }}
+        uses: Macro-Deck-App/GitHub-Actions/actions/setup-plugin-cli@v1
+        with:
+          cli-version: ${{ inputs.cli-version }}
+
+      # Registration, protocol negotiation, capabilities, timeouts, disconnect and reconnect, against a
+      # disposable stub host. Only a failed required check fails the run. The JSON report goes to the
+      # Platform with the build, for the moderator; the job summary is rendered from it.
+      - name: Run the conformance suite
+        if: ${{ matrix.rid != '' }}
+        shell: bash
+        env:
+          PACKAGE: ${{ runner.temp }}/handoff/${{ env.PACKAGE_FILE_NAME }}
+        run: |
+          set -uo pipefail
+          report="${RUNNER_TEMP}/conformance/conformance.json"
+          rm -rf "${RUNNER_TEMP}/conformance"
+          mkdir -p "${RUNNER_TEMP}/conformance"
+          macrodeck-plugin test --artifact "${PACKAGE}" --report json --output "${report}"
+          status=$?
+          if [ -f "${report}" ]; then
+            jq -r '
+              def cell: tostring | gsub("\\|"; "\\|") | gsub("\n"; " ");
+              def tag: {passed: "PASS", failed: "FAIL", skipped: "SKIP", inconclusive: "INCONCLUSIVE"}[.] // .;
+              "# Macro Deck plugin conformance report\n",
+              "Suite version: `\(.suiteVersion)`  ",
+              "Plugin: `\(.pluginId // "(unknown)")` `\(.pluginVersion // "(unknown)")`  ",
+              "Conformant: **\(if .conformant then "yes" else "no" end)**  ",
+              "Passed: \(.passed) - Failed: \(.failed) - Skipped: \(.skipped)\n",
+              "| Id | Title | Requirement | Outcome | Detail |",
+              "|---|---|---|---|---|",
+              (.results[] | "| \(.id) | \(.title | cell) | \(.requirement) | \(.result.outcome | tag) | \(
+                if .result.outcome == "failed" then "Expected: \(.result.expected // "" | cell)<br>Actual: \(.result.actual // "" | cell)"
+                else (.result.skipReason // "" | cell) end) |")
+            ' "${report}" >> "${GITHUB_STEP_SUMMARY}" \
+              || echo "::warning::The conformance report could not be summarised."
+          fi
+          case "${status}" in
+            0) echo "The plugin passed every required conformance check." ;;
+            1) echo "::error title=Conformance failed::A required conformance check failed. See the job summary." ;;
+            *) echo "::error title=The plugin did not run::macrodeck-plugin test exited with ${status}. See the log above." ;;
+          esac
+          exit "${status}"
+
+      # Written by the job that ran the plugin, so the Platform treats it as advisory: the moderator reads
+      # it, it never decides anything.
+      - name: Hand the report over
+        if: ${{ matrix.rid != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ needs.plan.outputs.handoff-prefix }}-conformance-${{ matrix.rid }}
+          path: ${{ runner.temp }}/conformance/conformance.json
+          retention-days: 1
+          if-no-files-found: warn
+
+  upload:
+    name: Upload to the Platform
+    needs: [plan, build, package, stub-host]
+    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.package.result == 'success' || needs.package.result == 'skipped') && (needs.stub-host.result == 'success' || needs.stub-host.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      # The only permission this job has, and the only job that has it. Without it the runner cannot
+      # mint an OIDC token and the upload has no credential at all - there is no fallback secret.
+      id-token: write
+    # From `package` when the build was split per platform, from `build` when one job built everything.
+    env:
+      HANDOFF: ${{ needs.package.outputs.handoff || needs.build.outputs.handoff }}
+      PACKAGE_FILE_NAME: ${{ needs.package.outputs.package-file-name || needs.build.outputs.package-file-name }}
+      SHA256: ${{ needs.package.outputs.sha256 || needs.build.outputs.sha256 }}
+    steps:
+      - name: Download the package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.HANDOFF }}
+          path: ${{ runner.temp }}/handoff
+      # Optional: there are none when the stub host was skipped, and their absence never fails the
+      # upload. One directory per platform, named after its artifact.
+      - name: Download the conformance reports
+        if: ${{ needs.stub-host.result == 'success' }}
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: ${{ needs.plan.outputs.handoff-prefix }}-conformance-*
+          path: ${{ runner.temp }}/conformance
+
+      # build-metadata.json says which Project this upload is for, which version and build it is,
+      # and nothing else. The package identifier is the id in the package's own manifest.json, so the
+      # upload can never name a different package than the one it contains. Every provenance value -
+      # repository, commit, tag, run - is read from the OIDC token by the Platform, so writing them here
+      # would achieve nothing: they are ignored.
+      - name: Pack the upload
+        env:
+          DECLARED_VERSION: ${{ inputs.version }}
+          BUILD: ${{ inputs.build }}
+          CHANGELOG: ${{ inputs.changelog }}
+          CONFORMANCE_PREFIX: ${{ needs.plan.outputs.handoff-prefix }}-conformance-
+          STUB_HOST_MATRIX: ${{ needs.plan.outputs.stub-host-matrix }}
+        run: |
+          set -euo pipefail
+
+          handoff="${RUNNER_TEMP}/handoff"
+          package="${handoff}/${PACKAGE_FILE_NAME}"
+
+          actual="$(sha256sum < "${package}" | cut -d' ' -f1)"
+          if [ "${actual}" != "${SHA256}" ]; then
+            echo "::error::${PACKAGE_FILE_NAME} is not the package the build produced: its SHA-256 is ${actual}, the build recorded ${SHA256}."
+            exit 1
+          fi
+
+          package_id="$(unzip -p "${package}" manifest.json | jq -r '.id // empty')"
+          if [ -z "${package_id}" ]; then
+            echo "::error::The package's manifest.json has no id."
+            exit 1
+          fi
+
+          echo "Publishing ${package_id}."
+
+          upload="${RUNNER_TEMP}/upload"
+          rm -rf "${upload}"
+          mkdir -p "${upload}"
+
+          cp "${package}" "${upload}/${PACKAGE_FILE_NAME}"
+
+          if [ ! -f "${handoff}/dependencies.json" ]; then
+            echo "::error::The build handed over no dependency list, and the Platform refuses a build without one."
+            exit 1
+          fi
+
+          cp "${handoff}/dependencies.json" "${upload}/dependencies.json"
+
+          # Optional, and sent as the suite wrote them: the Platform never refuses a build over one, and
+          # shows the moderator a report it cannot read as such. One per platform, named after it, so
+          # the review shows each in a tab of its own.
+          reports=""
+
+          echo "Downloaded conformance reports:"
+          find "${RUNNER_TEMP}/conformance" -type f -print 2>/dev/null || true
+
+          echo "Expected stub host RIDs:"
+          jq -r '.include[].rid' <<< "${STUB_HOST_MATRIX}"
+
+          while read -r rid; do
+            [ -n "${rid}" ] || continue
+
+            # A pattern matching several artifacts extracts each into a directory named after it; one
+            # matching a single artifact extracts it straight into the path.
+            report="${RUNNER_TEMP}/conformance/${CONFORMANCE_PREFIX}${rid}/conformance.json"
+            if [ ! -f "${report}" ] && [ "$(jq '.include | length' <<< "${STUB_HOST_MATRIX}")" = "1" ]; then
+              report="${RUNNER_TEMP}/conformance/conformance.json"
+            fi
+
+            if [ -f "${report}" ]; then
+              mkdir -p "${upload}/conformance"
+              cp "${report}" "${upload}/conformance/${rid}.json"
+              reports="${reports:+${reports}, }${rid}"
+            else
+              echo "::warning::No conformance report found for ${rid}: ${report}"
+            fi
+          done < <(jq -r '.include[].rid' <<< "${STUB_HOST_MATRIX}")
+
+          if [ -n "${reports}" ]; then
+            echo "Uploading the conformance reports of ${reports}."
+          else
+            echo "::warning::No conformance report is uploaded: the plugin was not run on a stub host. The moderator is told so."
+          fi
+
+          jq -n \
+            --arg packageId "${package_id}" \
+            --arg version "${DECLARED_VERSION#v}" \
+            --arg build "${BUILD:-${GITHUB_RUN_NUMBER}}" \
+            --arg artifactFileName "${PACKAGE_FILE_NAME}" \
+            --arg changelog "${CHANGELOG}" \
+            '{
+              schemaVersion: 1,
+              packageId: $packageId,
+              version: $version,
+              build: $build,
+              artifactFileName: $artifactFileName,
+              changelog: $changelog
+            }' \
+            > "${upload}/build-metadata.json"
+
+          (cd "${upload}" && zip -q -r ../build.zip .)
+
+      # Requested as late as possible: the token is short-lived.
+      - name: Request a build identity and upload
+        env:
+          AUDIENCE: ${{ inputs.audience }}
+          PLATFORM_URL: ${{ inputs.platform-url }}
+        run: |
+          set -euo pipefail
+          echo "Requesting a GitHub Actions OIDC token for ${AUDIENCE}..."
+          token="$(curl -sSf \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -r '.value')"
+          if [ -z "${token}" ] || [ "${token}" = "null" ]; then
+            echo "::error::No OIDC token was issued. Does the job have id-token: write?"
+            exit 1
+          fi
+          echo "Uploading $(du -h "${RUNNER_TEMP}/build.zip" | cut -f1) to ${PLATFORM_URL%/}/api/v1/builds..."
+          # The progress meter stays on (no -s): once it reaches 100% the time left is the Platform
+          # verifying and storing the build. HTTP/1.1 because an HTTP/2 stream is capped by the proxy's
+          # flow-control window (64 KiB in Envoy), which limits a long-distance upload to about half a
+          # megabyte per second.
+          response="${RUNNER_TEMP}/upload-response.json"
+          if ! status="$(curl -S --http1.1 -o "${response}" -w '%{http_code}' -X POST "${PLATFORM_URL%/}/api/v1/builds" \
+            -H "Authorization: Bearer ${token}" \
+            -H "Content-Type: application/zip" \
+            --data-binary @"${RUNNER_TEMP}/build.zip")"; then
+            echo "::error title=Upload failed::The build could not be sent to ${PLATFORM_URL%/}. See the log above."
+            exit 1
+          fi
+
+          if [ "${status}" -ge 200 ] && [ "${status}" -lt 300 ]; then
+            echo "The Macro Deck Platform accepted the build (HTTP ${status})."
+            exit 0
+          fi
+
+          # A refusal is written to be read by whoever triggered the release: its title and detail become
+          # the run's error annotation and job summary, and the run fails.
+          title="$(jq -r '.title // empty' "${response}" 2>/dev/null || true)"
+          detail="$(jq -r '.detail // empty' "${response}" 2>/dev/null || true)"
+          [ -n "${title}" ] || title="The Macro Deck Platform refused the build (HTTP ${status})."
+          [ -n "${detail}" ] || detail="$(head -c 2000 "${response}" 2>/dev/null || true)"
+          escape_data() { local value="${1//%/%25}"; value="${value//$'\r'/%0D}"; printf '%s' "${value//$'\n'/%0A}"; }
+          escape_property() { local value; value="$(escape_data "$1")"; value="${value//:/%3A}"; printf '%s' "${value//,/%2C}"; }
+          echo "::error title=$(escape_property "${title}")::$(escape_data "${detail:-${title}}")"
+          {
+            echo "### The Macro Deck Platform refused this build"
+            echo
+            echo "**${title}**"
+            echo
+            [ -z "${detail}" ] || echo "${detail}"
+            echo
+            echo "HTTP ${status}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          exit 1
