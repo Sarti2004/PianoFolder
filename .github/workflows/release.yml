@@ -14,4 +14,3 @@ jobs:
       version: ${{ github.event.release.tag_name }}
       source: src
       changelog: ${{ github.event.release.body }}
-      build-per-platform: true
