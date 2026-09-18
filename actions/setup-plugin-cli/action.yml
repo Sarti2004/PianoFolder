@@ -1,0 +1,33 @@
+name: Set up the Macro Deck plugin CLI
+description: Installs .NET and the MacroDeck.Plugin.Cli global tool, which provides `macrodeck-plugin`.
+
+inputs:
+  cli-version:
+    description: >-
+      The MacroDeck.Plugin.Cli version to install. Defaults to the newest release that carries every
+      command this repository's actions use.
+    required: false
+    default: ''
+  dotnet-version:
+    description: The .NET SDK version to set up.
+    required: false
+    default: 10.0.x
+
+runs:
+  using: composite
+  steps:
+    - name: Set up .NET
+      uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      with:
+        dotnet-version: ${{ inputs.dotnet-version }}
+
+    # Pinned rather than --prerelease, which resolves to 3.0.0-preview.10: SemVer orders `beta` before
+    # `preview`, so the newest published release is not the one --prerelease picks, and preview.10 has
+    # no `merge` command. Raise this when the CLI's prerelease labels are back in order.
+    - name: Install the Macro Deck plugin CLI
+      shell: bash
+      env:
+        CLI_VERSION: ${{ inputs.cli-version || '3.0.0-beta.11' }}
+      run: |
+        set -euo pipefail
+        dotnet tool install --global MacroDeck.Plugin.Cli --version "${CLI_VERSION}"
