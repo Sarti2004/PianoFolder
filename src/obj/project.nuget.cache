@@ -1,0 +1,20 @@
+{
+  "version": 2,
+  "dgSpecHash": "jkEvpAaupBA=",
+  "success": true,
+  "projectFilePath": "/Users/shcherbakov/Desktop/garbage/test1/PianoFolder/src/PianoFolder.csproj",
+  "expectedPackageFiles": [
+    "/Users/shcherbakov/.nuget/packages/macrodeck.localization/3.0.0-beta.11/macrodeck.localization.3.0.0-beta.11.nupkg.sha512",
+    "/Users/shcherbakov/.nuget/packages/macrodeck.plugin.analyzers/3.0.0-beta.11/macrodeck.plugin.analyzers.3.0.0-beta.11.nupkg.sha512",
+    "/Users/shcherbakov/.nuget/packages/macrodeck.plugin.hosting/3.0.0-beta.11/macrodeck.plugin.hosting.3.0.0-beta.11.nupkg.sha512",
+    "/Users/shcherbakov/.nuget/packages/macrodeck.plugin.protocol/3.0.0-beta.11/macrodeck.plugin.protocol.3.0.0-beta.11.nupkg.sha512",
+    "/Users/shcherbakov/.nuget/packages/macrodeck.plugin.serilog/3.0.0-beta.11/macrodeck.plugin.serilog.3.0.0-beta.11.nupkg.sha512",
+    "/Users/shcherbakov/.nuget/packages/macrodeck.sdk/3.0.0-beta.11/macrodeck.sdk.3.0.0-beta.11.nupkg.sha512",
+    "/Users/shcherbakov/.nuget/packages/macrodeck.ui/3.0.0-beta.11/macrodeck.ui.3.0.0-beta.11.nupkg.sha512",
+    "/Users/shcherbakov/.nuget/packages/macrodeck.ui.model/3.0.0-beta.11/macrodeck.ui.model.3.0.0-beta.11.nupkg.sha512",
+    "/Users/shcherbakov/.nuget/packages/serilog/4.4.0/serilog.4.4.0.nupkg.sha512",
+    "/Users/shcherbakov/.nuget/packages/serilog.extensions.hosting/10.0.0/serilog.extensions.hosting.10.0.0.nupkg.sha512",
+    "/Users/shcherbakov/.nuget/packages/serilog.extensions.logging/10.0.0/serilog.extensions.logging.10.0.0.nupkg.sha512"
+  ],
+  "logs": []
+}

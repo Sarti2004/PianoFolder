@@ -1,0 +1,23 @@
+{
+  "$schema": "https://schemas.macro-deck.app/plugin-manifest-v1.schema.json",
+  "manifestVersion": 1,
+  "id": "app.sarti-2004.pianofolder",
+  "name": "Piano Folder",
+  "version": "0.1.1",
+  "description": "Piano keyboard emulation for DoriDeck and Macro Deck.",
+  "icon": "Assets/icon.svg",
+  "homepage": "https://github.com/Sarti2004/PianoFolder",
+  "repository": "https://github.com/Sarti2004/PianoFolder",
+  "entrypoints": {
+    "win-x64": { "executable": "runtimes/win-x64/Sarti2004.PianoFolder.exe" },
+    "osx-arm64": { "executable": "runtimes/osx-arm64/Sarti2004.PianoFolder" },
+    "linux-x64": { "executable": "runtimes/linux-x64/Sarti2004.PianoFolder" }
+  },
+  "publisher": {
+    "name": "Example Publisher"
+  },
+  "license": "MIT",
+  "compatibility": {
+    "macroDeck": ">=3.0.0-0"
+  }
+}
