@@ -16,6 +16,10 @@
     "osx-arm64": {
       "executable": "runtimes/osx-arm64/PianoFolder.dll",
       "runtime": { "kind": "FrameworkDependent", "dotnetVersion": "10.0" }
+    },
+    "linux-x64": {
+      "executable": "runtimes/linux-x64/PianoFolder.dll",
+      "runtime": { "kind": "FrameworkDependent", "dotnetVersion": "10.0" }
     }
     
   },
