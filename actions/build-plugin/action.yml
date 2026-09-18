@@ -1,0 +1,78 @@
+name: Build a Macro Deck plugin
+description: >-
+  Writes the declared version into manifest.json, then builds and packs the plugin into a single
+  .macroDeckPlugin with `macrodeck-plugin build`. Needs the CLI, see setup-plugin-cli.
+
+inputs:
+  source:
+    description: The plugin project directory, holding manifest.json and macrodeck-build.json.
+    required: true
+  version:
+    description: >-
+      The version to build; one leading `v` is dropped, so a tag name can be passed as-is. It is
+      written into manifest.json and set as the assembly version, so the version in the repository
+      does not matter. Leave empty to build the manifest's own version.
+    required: false
+    default: ''
+  rid:
+    description: >-
+      Build only this runtime identifier, which the manifest must declare, and name the package
+      <id>-<version>-<rid>.macroDeckPlugin. Leave empty to build every runtime identifier the
+      manifest declares. Packages built this way on several runners are combined with
+      `macrodeck-plugin merge`.
+    required: false
+    default: ''
+  output-directory:
+    description: Where the package is written. Defaults to a directory under $RUNNER_TEMP.
+    required: false
+    default: ''
+
+outputs:
+  package-path:
+    description: The absolute path of the built .macroDeckPlugin.
+    value: ${{ steps.build.outputs.package-path }}
+  package-file-name:
+    description: The file name of the built .macroDeckPlugin.
+    value: ${{ steps.build.outputs.package-file-name }}
+
+runs:
+  using: composite
+  steps:
+    # A plain `dotnet publish` output is not packable: the manifest points at runtimes/<rid>/,
+    # which only `macrodeck-plugin build` assembles.
+    # MSBuild reads environment variables as properties, so Version= below becomes the assembly
+    # version. The same is why the input is not in an env var named VERSION: with its `v` intact
+    # it is not a valid package version, and restore fails without logging why.
+    - name: Build and pack
+      id: build
+      shell: bash
+      env:
+        SOURCE: ${{ inputs.source }}
+        DECLARED_VERSION: ${{ inputs.version }}
+        RID: ${{ inputs.rid }}
+        OUTPUT_DIRECTORY: ${{ inputs.output-directory }}
+      run: |
+        set -euo pipefail
+        output="${OUTPUT_DIRECTORY:-${RUNNER_TEMP}/macro-deck-plugin}"
+        declared="${DECLARED_VERSION#v}"
+        arguments=(build --source "${SOURCE}" --output "${output}")
+        if [ -n "${RID}" ]; then
+          arguments+=(--rid "${RID}")
+        fi
+        if [ -n "${declared}" ]; then
+          jq --arg version "${declared}" '.version = $version' "${SOURCE}/manifest.json" \
+            > "${RUNNER_TEMP}/manifest.json"
+          mv "${RUNNER_TEMP}/manifest.json" "${SOURCE}/manifest.json"
+          Version="${declared}" macrodeck-plugin "${arguments[@]}"
+        else
+          macrodeck-plugin "${arguments[@]}"
+        fi
+        shopt -s nullglob
+        packages=("${output}"/*.macroDeckPlugin)
+        if [ "${#packages[@]}" -ne 1 ]; then
+          echo "::error::Expected exactly one .macroDeckPlugin, found ${#packages[@]}."
+          exit 1
+        fi
+        package="$(realpath "${packages[0]}")"
+        echo "package-path=${package}" >> "${GITHUB_OUTPUT}"
+        echo "package-file-name=$(basename "${package}")" >> "${GITHUB_OUTPUT}"
