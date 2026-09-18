@@ -10,8 +10,7 @@
   "repository": "https://github.com/Sarti2004/PianoFolder",
   "entrypoints": {
     "win-x64": { "executable": "runtimes/win-x64/Sarti2004.PianoFolder.exe" },
-    "osx-arm64": { "executable": "runtimes/osx-arm64/Sarti2004.PianoFolder" },
-    "linux-x64": { "executable": "runtimes/linux-x64/Sarti2004.PianoFolder" }
+    "osx-arm64": { "executable": "runtimes/osx-arm64/Sarti2004.PianoFolder" }
   },
   "publisher": {
     "name": "Example Publisher"

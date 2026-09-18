@@ -14,7 +14,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("PianoFolder")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+138e69b665e54f533b3a430caa95010027de81e0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+b2ff3a06a7d63b356203f04ec96fbfab5cac918d")]
 [assembly: System.Reflection.AssemblyProductAttribute("PianoFolder")]
 [assembly: System.Reflection.AssemblyTitleAttribute("PianoFolder")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

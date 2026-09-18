@@ -7,7 +7,6 @@ using MacroDeck.Sdk.Ui;
 using MacroDeck.Ui.Model.Surfaces;
 using MacroDeck.Ui.Runtime;
 using PianoFolder.Notes;
-using PianoFolder.Piano;
 using Serilog;
 
 namespace PianoFolder;
