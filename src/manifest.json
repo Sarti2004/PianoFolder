@@ -10,11 +10,11 @@
   "repository": "https://github.com/Sarti2004/PianoFolder",
   "entrypoints": {
     "win-x64": {
-      "executable": "runtimes/win-x64/MacroDeck.PluginTemplate.dll",
+      "executable": "runtimes/win-x64/PianoFolder.dll",
       "runtime": { "kind": "FrameworkDependent", "dotnetVersion": "10.0" }
     },
     "osx-arm64": {
-      "executable": "runtimes/osx-arm64/MacroDeck.PluginTemplate.dll",
+      "executable": "runtimes/osx-arm64/PianoFolder.dll",
       "runtime": { "kind": "FrameworkDependent", "dotnetVersion": "10.0" }
     }
     
